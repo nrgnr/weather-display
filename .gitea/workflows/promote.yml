@@ -1,0 +1,199 @@
+name: Promote Gate
+on: [push]
+
+jobs:
+  security-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for promote trigger
+        id: check
+        run: |
+          if [ ! -f .promote ]; then
+            echo "No .promote file found — skipping promote gate"
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Remove .promote trigger immediately
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          # Save config before deleting
+          cp .promote /tmp/promote_config.json
+
+          # Configure git for push
+          GITEA_TOKEN=$(node -e "console.log(JSON.parse(require('fs').readFileSync('.promote','utf8')).gitea_token)")
+          git config user.name "Promote Gate CI"
+          git config user.email "ci@nrgnr.app"
+          git remote set-url origin "https://hardy:${GITEA_TOKEN}@git.nrgnr.app/NRGNR/${{ github.event.repository.name }}.git"
+
+          # Pull latest, remove .promote, push
+          git pull --rebase origin main || true
+          git rm .promote
+          git commit -m "Remove promote trigger [skip ci]"
+          git push origin main
+          echo ".promote removed via git push"
+
+      - name: Secret scanning (gitleaks)
+        id: gitleaks
+        if: steps.check.outputs.skip != 'true'
+        continue-on-error: true
+        run: |
+          curl -sSfL https://github.com/gitleaks/gitleaks/releases/latest/download/gitleaks_8.21.2_linux_x64.tar.gz | tar xz
+          ./gitleaks detect --source . --verbose --no-banner 2>&1 | tee /tmp/gitleaks.txt
+          exit ${PIPESTATUS[0]}
+
+      - name: Vulnerability scan (trivy)
+        id: trivy
+        if: steps.check.outputs.skip != 'true'
+        continue-on-error: true
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+          trivy fs --severity HIGH,CRITICAL --exit-code 1 --ignore-unfixed . 2>&1 | tee /tmp/trivy.txt
+          exit ${PIPESTATUS[0]}
+
+      - name: Install dependencies
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          if [ -f package-lock.json ]; then npm ci; elif [ -f package.json ]; then npm install; fi
+
+      - name: Audit dependencies
+        id: audit
+        if: steps.check.outputs.skip != 'true'
+        continue-on-error: true
+        run: npm audit --audit-level=moderate 2>&1 | tee /tmp/audit.txt
+
+      - name: Lint
+        id: lint
+        if: steps.check.outputs.skip != 'true'
+        continue-on-error: true
+        run: npm run lint --if-present 2>&1 | tee /tmp/lint.txt
+
+      - name: Test
+        id: test
+        if: steps.check.outputs.skip != 'true'
+        continue-on-error: true
+        run: npm test --if-present 2>&1 | tee /tmp/test.txt
+
+      - name: Build
+        id: build
+        if: steps.check.outputs.skip != 'true'
+        continue-on-error: true
+        run: npm run build --if-present 2>&1 | tee /tmp/build.txt
+
+      - name: Build report, commit, and trigger Phase 2
+        if: steps.check.outputs.skip != 'true'
+        env:
+          COMMIT_SHA: ${{ github.sha }}
+          GITLEAKS_RESULT: ${{ steps.gitleaks.outcome }}
+          TRIVY_RESULT: ${{ steps.trivy.outcome }}
+          AUDIT_RESULT: ${{ steps.audit.outcome }}
+          LINT_RESULT: ${{ steps.lint.outcome }}
+          TEST_RESULT: ${{ steps.test.outcome }}
+          BUILD_RESULT: ${{ steps.build.outcome }}
+        run: |
+          node << 'NODESCRIPT'
+          const fs = require('fs');
+          const https = require('https');
+          const http = require('http');
+
+          // Read config from saved copy (original .promote was git-removed earlier)
+          const config = JSON.parse(fs.readFileSync('/tmp/promote_config.json', 'utf8'));
+          const { app_name: APP_NAME, target: TARGET, platform: PLATFORM, gitea_token: GITEA_TOKEN, webhook_url: WEBHOOK_URL, mattermost_webhook: MM_WEBHOOK, layers: LAYERS } = config;
+
+          const steps = {
+            gitleaks: process.env.GITLEAKS_RESULT,
+            trivy: process.env.TRIVY_RESULT,
+            audit: process.env.AUDIT_RESULT,
+            lint: process.env.LINT_RESULT,
+            test: process.env.TEST_RESULT,
+            build: process.env.BUILD_RESULT
+          };
+
+          const icon = s => s === 'success' ? 'PASS' : s === 'failure' ? 'FAIL' : 'SKIP';
+          const hasFail = Object.values(steps).some(s => s === 'failure');
+          const overall = hasFail ? 'FAILED' : 'PASSED';
+
+          const SHA = process.env.COMMIT_SHA;
+          const DATE = new Date().toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
+
+          let report = '# Promote Gate Report\n\n';
+          report += '**App:** ' + APP_NAME + '\n';
+          report += '**Target:** ' + TARGET + '\n';
+          report += '**Date:** ' + DATE + '\n';
+          report += '**Commit:** `' + SHA + '`\n';
+          report += '**Result:** **' + overall + '**\n\n';
+          report += '## Summary\n\n| Check | Result |\n|-------|--------|\n';
+          for (const [name, result] of Object.entries(steps)) {
+            report += '| ' + name + ' | ' + icon(result) + ' |\n';
+          }
+
+          for (const name of ['gitleaks','trivy','audit','lint','test','build']) {
+            const file = '/tmp/' + name + '.txt';
+            if (fs.existsSync(file)) {
+              const content = fs.readFileSync(file, 'utf8').slice(0, 3000);
+              if (content.trim()) {
+                report += '\n## ' + name + '\n\n```\n' + content + '\n```\n';
+              }
+            }
+          }
+
+          const encoded = Buffer.from(report).toString('base64');
+          const reportDate = new Date().toISOString().replace(/[-:T.]/g, '').slice(0, 14);
+          const reportPath = 'reports/promote-' + reportDate + '.md';
+
+          function httpReq(opts) {
+            return new Promise((resolve, reject) => {
+              const u = new URL(opts.url);
+              const mod = u.protocol === 'https:' ? https : http;
+              const req = mod.request({ hostname: u.hostname, port: u.port, path: u.pathname + u.search,
+                method: opts.method || 'GET', headers: opts.headers || {} }, res => {
+                let d = ''; res.on('data', c => d += c); res.on('end', () => resolve({ status: res.statusCode, data: d }));
+              });
+              req.on('error', reject);
+              if (opts.body) req.write(opts.body);
+              req.end();
+            });
+          }
+
+          (async () => {
+            try {
+              // Commit report via API
+              const commitRes = await httpReq({
+                method: 'POST',
+                url: 'https://git.nrgnr.app/api/v1/repos/NRGNR/' + APP_NAME + '/contents/' + reportPath,
+                headers: { 'Authorization': 'token ' + GITEA_TOKEN, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ content: encoded, message: 'Promote gate report: ' + overall + ' (' + TARGET + ')' })
+              });
+              console.log('Report committed:', reportPath, overall, 'status:', commitRes.status);
+
+              // Notify Mattermost
+              const mmText = hasFail
+                ? ':warning: **Promote gate warnings: ' + APP_NAME + ' → ' + TARGET + '**\n' +
+                  Object.entries(steps).filter(([,s]) => s==='failure').map(([k]) => '- ' + k + ': failed').join('\n') +
+                  '\n\nReport committed. Proceeding with staging provisioning.'
+                : ':white_check_mark: **Promote gate passed: ' + APP_NAME + ' → ' + TARGET + '**\nAll checks passed. Proceeding with staging provisioning.';
+              await httpReq({
+                method: 'POST', url: MM_WEBHOOK,
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text: mmText })
+              });
+              console.log('Mattermost notified');
+
+              // Trigger Phase 2
+              const phase2Res = await httpReq({
+                method: 'POST', url: WEBHOOK_URL,
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ app_name: APP_NAME, target: TARGET, platform: PLATFORM, layers: LAYERS })
+              });
+              console.log('Phase 2 triggered, status:', phase2Res.status);
+            } catch (err) {
+              console.error('Error in report step:', err.message);
+              process.exit(1);
+            }
+          })();
+          NODESCRIPT
